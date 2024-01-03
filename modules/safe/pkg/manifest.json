@@ -1,0 +1,14 @@
+[
+    {
+        "process_name": "safe",
+        "process_wasm_path": "/safe.wasm",
+        "on_exit": "Restart",
+        "request_networking": true,
+        "request_messaging": [
+            "net:sys:uqbar",
+            "http_server:sys:uqbar",
+            "eth:sys:uqbar"
+        ],
+        "public": true
+    }
+]
