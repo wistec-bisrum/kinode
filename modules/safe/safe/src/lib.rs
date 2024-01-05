@@ -1,12 +1,15 @@
+use alloy_rpc_types::Log;
+use alloy_sol_types::{sol, SolEvent};
 use anyhow::Result;
 use serde::{Deserialize, Serialize, };
 use std::collections::HashSet;
 use std::collections::hash_map::{ Entry, HashMap, };
+use std::str::FromStr;
 use uqbar_process_lib::{ 
     await_message, call_init, get_payload, http, println, set_state,
-    Address, Message, NodeId, Request
+    Address, Message, NodeId, Payload, Request, 
 };
-use uqbar_process_lib::eth::EthAddress;
+use uqbar_process_lib::eth::{EthAddress, SubscribeLogsRequest};
 
 wit_bindgen::generate!({
     path: "../../../wit",
@@ -18,6 +21,14 @@ wit_bindgen::generate!({
 
 call_init!(init);
 
+sol! {
+    event ProxyCreation(address proxy, address singleton);
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum IndexerActions {
+    EventSubscription(Log),
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 enum SafeActions {
@@ -71,14 +82,32 @@ fn print_type_of<T>(_: &T) {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct State {
+    ws_channel: u32,
+    safe_blocks: HashMap<EthAddress, u64>,
     safes: HashMap<EthAddress, Safe>,
 }
 
 fn init (our: Address) {
 
     let mut state = State {
+        ws_channel: 0,
+        safe_blocks: HashMap::new(),
         safes: HashMap::new(),
     };
+
+    match main(our, state) {
+        Ok(_) => {}
+        Err(e) => println!("Error: {:?}", e)
+    }
+}
+
+fn main(our: Address, mut state: State) -> Result<()> {
+
+    SubscribeLogsRequest::new()
+        .address(EthAddress::from_str("0xc22834581ebc8527d974f8a1c97e1bea4ef910bc")?)
+        .from_block(2087031)
+        .events(vec!["ProxyCreation(address,address)"])
+        .send()?;
 
     http::bind_http_path("/", true, false).unwrap();
     http::bind_http_path("/safe", true, false).unwrap();
@@ -104,7 +133,6 @@ fn init (our: Address) {
         }
         let _ = set_state(&bincode::serialize(&state).unwrap());
     }
-
 }
 
 fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
@@ -113,8 +141,8 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Re
         return Ok(());
     }
 
-    if msg.source().node != our.node {
-        handle_p2p_request(msg);
+    if  msg.source().node != our.node {
+            handle_p2p_request(our, msg, state);
     } else if
         msg.source().node == our.node && 
         msg.source().process == "terminal:terminal:uqbar" {
@@ -123,14 +151,67 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Re
         msg.source().node == our.node &&
         msg.source().process == "http_server:sys:uqbar" {
             handle_http_request(our, msg, state);
+    } else if
+        msg.source().node == our.node &&
+        msg.source().process == "eth:sys:uqbar" {
+            handle_eth_request(our, msg, state);
     }
 
     Ok(())
 
 }
 
-fn handle_p2p_request(msg: &Message) -> anyhow::Result<()> {
-    println!("p2p message: {:?}", msg);
+fn handle_eth_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+
+    match serde_json::from_slice::<IndexerActions>(msg.ipc())? {
+        IndexerActions::EventSubscription(e) => {
+            match e.topics[0].clone() {
+                ProxyCreation::SIGNATURE_HASH => {
+                    let decoded = ProxyCreation::abi_decode_data(&e.data, false)?;
+                    let proxy = decoded.0.to_string();
+                    let block = e.block_number.expect("REASON").to::<u64>();
+                    state.safe_blocks.insert(EthAddress::from_str(&proxy)?, block);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+
+}
+
+fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+
+    println!("handling p2p request");
+
+    match serde_json::from_slice::<SafeActions>(msg.ipc())? {
+        SafeActions::AddSafe(AddSafe{ safe }) => {
+            println!("add safe: {:?}", safe);
+
+            let safe = state.safes.entry(safe).or_insert(Safe::default());
+            safe.peers.insert(msg.source().node.clone());
+
+            Request::new()
+                .target((&our.node, "http_server", "sys", "uqbar"))
+                .ipc(serde_json::to_vec(
+                    &http::HttpServerRequest::WebSocketPush {
+                        channel_id: state.ws_channel,
+                        message_type: http::WsMessageType::Binary,
+                    },
+                )?)
+                .payload(Payload {
+                    mime: Some("application/json".to_string()),
+                    bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
+                })
+                .send()?;
+        }
+        SafeActions::AddPeer(AddPeer{ safe, peer }) => {
+            println!("add peer: {:?} {:?}", safe, peer);
+        }
+    }
+
     Ok(())
 }
 
@@ -154,19 +235,16 @@ fn handle_http_request(our: &Address, msg: &Message, state: &mut State) -> anyho
             }
         }
         http::HttpServerRequest::WebSocketOpen { path, channel_id } => {
-            println!("websocket open!, {}, {}", path, channel_id);
+            state.ws_channel = channel_id;
             Ok(())
         }
         http::HttpServerRequest::WebSocketClose (channel_id) => {
-            println!("websocket close");
             Ok(())
         }
         http::HttpServerRequest::WebSocketPush { .. } => {
-            println!("websockets push");
             Ok(())
         }
         _ => {
-            println!("mysterious");
             Ok(())
         }
     }
@@ -304,17 +382,12 @@ fn handle_http_safe_peer(
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
                 Entry::Occupied(mut o) => {
                     let saved_safe = o.get_mut();
-                    match saved_safe.peers.contains(&peer) {
-                        true => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
-                        false => {
-                            saved_safe.peers.insert(peer.clone());
-                            Request::new()
-                                .target(Address{node:peer, process:our.process.clone()})
-                                .ipc(serde_json::to_vec(&AddSafe{ safe })?)
-                                .send()?;
-                            http::send_response(http::StatusCode::OK, None, vec![])
-                        }
-                    }
+                    saved_safe.peers.insert(peer.clone());
+                    Request::new()
+                        .target(Address{node:peer, process:our.process.clone()})
+                        .ipc(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{safe:safe}))?)
+                        .send()?;
+                    http::send_response(http::StatusCode::OK, None, vec![])
                 }
             };
         }
