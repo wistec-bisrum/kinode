@@ -5,8 +5,12 @@ use alloy_rpc_types::pubsub::SubscriptionResult;
 use alloy_transport_ws::WsConnect;
 use anyhow::Result;
 use dashmap::DashMap;
+use helios::client::{Client, ClientBuilder as HeliosBuilder};
+use helios::config::checkpoints;
+use helios::prelude::{networks::Network, BlockTag, FileDB};
 use lib::types::core::*;
 use lib::types::eth::*;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -17,6 +21,7 @@ use url::Url;
 pub enum ProviderConfig {
     Node(String),
     Provider(Provider<PubSubFrontend>),
+    Helios(Client<FileDB>), // can implement custom node vfs FileDb
 }
 
 /// The ETH provider runtime process is responsible for connecting to one or more ETH RPC providers
@@ -30,8 +35,17 @@ pub async fn provider(
     send_to_loop: MessageSender,
     mut recv_in_client: MessageReceiver,
     _print_tx: PrintSender,
+    home_directory_path: String,
 ) -> Result<()> {
     let our = Arc::new(our);
+
+    let helios_dir = format!("{}/helios", home_directory_path);
+    tokio::fs::create_dir_all(&helios_dir).await?;
+
+    // should be flag/in config.
+    // also note how only sepolia/mainnet can be configured to be trusted rn.
+    // improve that? à la starknet-beerus but for OP?
+    let trusted = false;
 
     // Initialize the provider conditionally based on rpc_url
     // Todo: make provider<T> support multiple transports, one direct and another passthrough.
@@ -40,12 +54,48 @@ pub async fn provider(
             // Validate and parse the WebSocket URL
             match Url::parse(&rpc_url)?.scheme() {
                 "ws" | "wss" => {
-                    let connector = WsConnect {
-                        url: rpc_url,
-                        auth: None,
-                    };
-                    let client = ClientBuilder::default().ws(connector).await?;
-                    ProviderConfig::Provider(Provider::new_with_client(client))
+                    if !trusted {
+                        // fetching "trusted" checkpoint option:
+                        let cf = checkpoints::CheckpointFallback::new()
+                            .build()
+                            .await
+                            .unwrap();
+                        let goerli_checkpoint =
+                            cf.fetch_latest_checkpoint(&Network::MAINNET).await.unwrap();
+
+                        println!("got goerli_checkpoint: {:?}", goerli_checkpoint);
+
+                        let consensus_rpc = "https://www.lightclientdata.org"; // mainnet
+                                                                               // ://lodestar-sepolia.chainsafe.io"; // sepolia
+                                                                               //  "http://testing.prater.beacon-api.nimbus.team"; // goerli
+                        let execution = "http api here...";
+
+                        let mut client: Client<FileDB> = HeliosBuilder::new()
+                            .network(Network::MAINNET)
+                            .consensus_rpc(consensus_rpc)
+                            .execution_rpc(execution)
+                            .checkpoint("0x2411728c2f7229a0db37f09a7587ad8b43102f8e2654290adc5c34109d666e1c") // does not work with checkpoint fetcher conversion..
+                            .rpc_port(8545)
+                            .data_dir(PathBuf::from(helios_dir))
+                            .build()
+                            .unwrap();
+
+                        client.start().await.unwrap();
+                        println!("client started..");
+                        client.wait_synced().await;
+                        println!("client synced..");
+
+                        let head_block_num = client.get_block_number().await.unwrap();
+                        println!("head_block_num: {:?}", head_block_num);
+                        ProviderConfig::Helios(client)
+                    } else {
+                        let connector = WsConnect {
+                            url: rpc_url,
+                            auth: None,
+                        };
+                        let client = ClientBuilder::default().ws(connector).await?;
+                        ProviderConfig::Provider(Provider::new_with_client(client))
+                    }
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
@@ -144,6 +194,13 @@ async fn handle_message(
                         )
                         .await?
                     }
+                }
+                ProviderConfig::Helios(client) => {
+                    // handle helios lol
+                    //client.get_balance(address, block)?;
+                    println!("trying helios...");
+                    let head_block_num = client.get_block_number().await.unwrap();
+                    println!("head_block_num: {:?}", head_block_num);
                 }
             }
         }

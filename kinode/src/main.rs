@@ -579,6 +579,7 @@ async fn main() {
         kernel_message_sender.clone(),
         eth_provider_receiver,
         print_sender.clone(),
+        home_directory_path.clone(),
     ));
     #[cfg(feature = "simulation-mode")]
     if let Some(ref rpc_url) = rpc_url {
@@ -625,7 +626,7 @@ async fn main() {
             }
         }
     };
-
+    println!("soethi");
     // gracefully abort all running processes in kernel
     let _ = kernel_message_sender
         .send(KernelMessage {
