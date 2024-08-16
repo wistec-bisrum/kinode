@@ -157,6 +157,8 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
   <script>
     let isInitialized = false;
+    let isSecureSubdomain = false;
+    let firstPathItem = '';
 
     function initializeLoginForm() {
       if ('${fake}' === 'true') {
@@ -165,10 +167,10 @@
         document.getElementById("fake-or-not").innerHTML = "Restart your node to change networking settings.";
       }
 
-      const firstPathItem = window.location.pathname.split('/')[1];
+      firstPathItem = window.location.pathname.split('/')[1];
       const expectedSecureSubdomain = generateSecureSubdomain(firstPathItem);
       const maybeSecureSubdomain = window.location.host.split('.')[0];
-      const isSecureSubdomain = expectedSecureSubdomain === maybeSecureSubdomain;
+      isSecureSubdomain = expectedSecureSubdomain === maybeSecureSubdomain;
       if (isSecureSubdomain) {
         document.getElementById("node-and-domain").innerText = "${node}: authenticate for secure subdomain app " + firstPathItem;
       } else {
